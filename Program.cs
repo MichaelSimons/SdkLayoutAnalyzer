@@ -5,12 +5,6 @@ using System.Reflection.PortableExecutable;
 
 public class Program
 {
-    private enum ScanType
-    {
-        Assemblies,
-        NonAssemblies
-    }
-
     public static void Main(string[] args)
     {
         if (args.Length < 1)
@@ -111,10 +105,10 @@ public class Program
         }
         finally
         {
-            //if (tempDir != null && Directory.Exists(tempDir))
-            //{
-            //    Directory.Delete(tempDir, true);
-            //}
+            if (tempDir != null && Directory.Exists(tempDir))
+            {
+               Directory.Delete(tempDir, true);
+            }
         }
     }
 
@@ -646,5 +640,11 @@ public class Program
         public PrimitiveTypeCode GetUnderlyingEnumType(object _) => PrimitiveTypeCode.Int32;
 
         public bool IsSystemType(object type) => type.Equals(typeof(Type));
+    }
+
+    private enum ScanType
+    {
+        Assemblies,
+        NonAssemblies
     }
 }

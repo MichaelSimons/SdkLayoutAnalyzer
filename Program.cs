@@ -103,10 +103,8 @@ public class Program
 
                 // Re-create the archive
                 string newArchivePath = CreateNewArchivePath(originalArchivePath!);
-                Console.WriteLine($"Creating new archive: {newArchivePath}");
                 CreateArchive(tempDir!, newArchivePath, originalArchivePath!);
                 newArchiveSize = new FileInfo(newArchivePath).Length;
-                Console.WriteLine($"New archive created successfully.");
             }
 
             PrintSummary(duplicateGroups, originalArchiveSize, newArchiveSize);
@@ -255,8 +253,17 @@ public class Program
                 var name = metadataReader.GetString(assemblyRef.Name);
                 var version = assemblyRef.Version;
 
-                // System.Runtime version mapping to frameworks
-                if (name == "System.Runtime" || name == "mscorlib" || name == "netstandard")
+                // Handle netstandard specifically
+                if (name == "netstandard")
+                {
+                    if (version.Major == 1)
+                        return $".NETStandard,Version=v1.{version.Minor}";
+                    else if (version.Major == 2)
+                        return $".NETStandard,Version=v2.{version.Minor}";
+                }
+
+                // System.Runtime and mscorlib version mapping to frameworks
+                if (name == "System.Runtime" || name == "mscorlib")
                 {
                     // Common version mappings
                     if (version.Major == 4)

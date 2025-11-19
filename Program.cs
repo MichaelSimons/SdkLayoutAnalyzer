@@ -160,6 +160,13 @@ public class Program
             }
             catch { }
 
+            // Try to get architecture from PE header
+            try
+            {
+                info = info with { Architecture = GetArchitecture(file) };
+            }
+            catch { }
+
             yield return info;
         }
     }
@@ -170,6 +177,30 @@ public class Program
         using var stream = File.OpenRead(filePath);
         var hash = sha256.ComputeHash(stream);
         return Convert.ToHexStringLower(hash);
+    }
+
+    private static string? GetArchitecture(string filePath)
+    {
+        try
+        {
+            using var stream = File.OpenRead(filePath);
+            using var peReader = new PEReader(stream);
+
+            var machine = peReader.PEHeaders.CoffHeader.Machine;
+            return machine switch
+            {
+                Machine.I386 => "x86",
+                Machine.Amd64 => "x64",
+                Machine.Arm => "arm",
+                Machine.Arm64 => "arm64",
+                Machine.IA64 => "ia64",
+                _ => machine.ToString()
+            };
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private static string? GetTargetFrameworkFromAssembly(string filePath)
@@ -345,14 +376,14 @@ public class Program
 
     private static void PrintDuplicates(List<IGrouping<(string? Filename, string? Culture, string? TargetFramework), SdkFileInfo>> duplicateGroups, string tempDir)
     {
-        Console.WriteLine("Filename,Culture,TargetFramework,RelativePath,AssemblyVersion,FileVersion,FileHash,FileSize");
+        Console.WriteLine("Filename,Culture,TargetFramework,RelativePath,AssemblyVersion,FileVersion,Architecture,FileHash,FileSize");
         foreach (var group in duplicateGroups)
         {
             foreach (var info in group.OrderBy(f => f.FilePath))
             {
                 string relPath = Path.GetRelativePath(tempDir, info.FilePath ?? "");
                 string tfm = EscapeCsv(info.TargetFramework);
-                Console.WriteLine($"{info.Filename},{info.Culture},{tfm},{relPath},{info.AssemblyVersion},{info.FileVersion},{info.FileHash},{info.FileSize}");
+                Console.WriteLine($"{info.Filename},{info.Culture},{tfm},{relPath},{info.AssemblyVersion},{info.FileVersion},{info.Architecture},{info.FileHash},{info.FileSize}");
             }
         }
     }
@@ -485,6 +516,7 @@ public class Program
         int sameHashCount = 0;
         int differentVersionCount = 0;
         int sameVersionDifferentHashCount = 0;
+        int sameVersionDifferentArchCount = 0;
 
         foreach (var group in duplicateGroups)
         {
@@ -511,6 +543,14 @@ public class Program
                 {
                     // Same version but different hash
                     sameVersionDifferentHashCount++;
+
+                    // Check if different architecture
+                    if (fileToKeep.Architecture != duplicate.Architecture &&
+                        !string.IsNullOrEmpty(fileToKeep.Architecture) &&
+                        !string.IsNullOrEmpty(duplicate.Architecture))
+                    {
+                        sameVersionDifferentArchCount++;
+                    }
                 }
             }
         }
@@ -523,6 +563,7 @@ public class Program
         Console.WriteLine($"  Duplicates with same hash as file to keep: {sameHashCount}");
         Console.WriteLine($"  Duplicates with different version: {differentVersionCount}");
         Console.WriteLine($"  Duplicates with same version but different hash: {sameVersionDifferentHashCount}");
+        Console.WriteLine($"    Of which same version but different arch: {sameVersionDifferentArchCount}");
 
         // Verify counts add up correctly
         int categorySum = sameHashCount + differentVersionCount + sameVersionDifferentHashCount;
@@ -598,6 +639,7 @@ public class Program
         public string? FilePath { get; init; }
         public string? AssemblyVersion { get; init; }
         public string? FileVersion { get; init; }
+        public string? Architecture { get; init; }
         public string? Culture { get; init; }
         public string? FileHash { get; init; }
         public long FileSize { get; init; }

@@ -571,7 +571,7 @@ public class Program
         Console.WriteLine($"  Duplicates with same hash as file to keep: {sameHashCount} ({sameHashSize / 1024.0 / 1024.0:F1} MB)");
         Console.WriteLine($"  Duplicates with different version: {differentVersionCount} ({differentVersionSize / 1024.0 / 1024.0:F1} MB)");
         Console.WriteLine($"  Duplicates with same version but different hash: {sameVersionDifferentHashCount} ({sameVersionDifferentHashSize / 1024.0 / 1024.0:F1} MB)");
-        Console.WriteLine($"    Of which same version but different arch: {sameVersionDifferentArchCount} ({sameVersionDifferentArchSize / 1024.0 / 1024.0:F1} MB)");
+        Console.WriteLine($"    Of which, same version but different arch: {sameVersionDifferentArchCount} ({sameVersionDifferentArchSize / 1024.0 / 1024.0:F1} MB)");
 
         // Verify counts add up correctly
         int categorySum = sameHashCount + differentVersionCount + sameVersionDifferentHashCount;

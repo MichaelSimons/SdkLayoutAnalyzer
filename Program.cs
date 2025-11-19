@@ -517,6 +517,10 @@ public class Program
         int differentVersionCount = 0;
         int sameVersionDifferentHashCount = 0;
         int sameVersionDifferentArchCount = 0;
+        long sameHashSize = 0;
+        long differentVersionSize = 0;
+        long sameVersionDifferentHashSize = 0;
+        long sameVersionDifferentArchSize = 0;
 
         foreach (var group in duplicateGroups)
         {
@@ -533,16 +537,19 @@ public class Program
                 {
                     // Same hash as file to keep
                     sameHashCount++;
+                    sameHashSize += duplicate.FileSize;
                 }
                 else if (keepVersion != dupVersion)
                 {
                     // Different version from file to keep
                     differentVersionCount++;
+                    differentVersionSize += duplicate.FileSize;
                 }
                 else
                 {
                     // Same version but different hash
                     sameVersionDifferentHashCount++;
+                    sameVersionDifferentHashSize += duplicate.FileSize;
 
                     // Check if different architecture
                     if (fileToKeep.Architecture != duplicate.Architecture &&
@@ -550,6 +557,7 @@ public class Program
                         !string.IsNullOrEmpty(duplicate.Architecture))
                     {
                         sameVersionDifferentArchCount++;
+                        sameVersionDifferentArchSize += duplicate.FileSize;
                     }
                 }
             }
@@ -560,10 +568,10 @@ public class Program
         Console.WriteLine($"Total duplicated file content (MB): {totalDuplicatedContent / 1024.0 / 1024.0:F1}");
         Console.WriteLine();
         Console.WriteLine("Duplicate categorization (relative to lowest version file to keep):");
-        Console.WriteLine($"  Duplicates with same hash as file to keep: {sameHashCount}");
-        Console.WriteLine($"  Duplicates with different version: {differentVersionCount}");
-        Console.WriteLine($"  Duplicates with same version but different hash: {sameVersionDifferentHashCount}");
-        Console.WriteLine($"    Of which same version but different arch: {sameVersionDifferentArchCount}");
+        Console.WriteLine($"  Duplicates with same hash as file to keep: {sameHashCount} ({sameHashSize / 1024.0 / 1024.0:F1} MB)");
+        Console.WriteLine($"  Duplicates with different version: {differentVersionCount} ({differentVersionSize / 1024.0 / 1024.0:F1} MB)");
+        Console.WriteLine($"  Duplicates with same version but different hash: {sameVersionDifferentHashCount} ({sameVersionDifferentHashSize / 1024.0 / 1024.0:F1} MB)");
+        Console.WriteLine($"    Of which same version but different arch: {sameVersionDifferentArchCount} ({sameVersionDifferentArchSize / 1024.0 / 1024.0:F1} MB)");
 
         // Verify counts add up correctly
         int categorySum = sameHashCount + differentVersionCount + sameVersionDifferentHashCount;

@@ -9,10 +9,11 @@ public class Program
     {
         if (args.Length < 1)
         {
-            Console.WriteLine("Usage: SdkLayoutAnalyzer <path-to-sdk-zip-or-tar> [subdirectory-relative-to-sdk-root] [--scan=assemblies|non-assemblies] [--remove-duplicates]");
+            Console.WriteLine("Usage: SdkLayoutAnalyzer <path-to-sdk-zip-or-tar> [subdirectory-relative-to-sdk-root] [--scan=assemblies|non-assemblies] [--remove-duplicates] [--analyze-different-tfms]");
             Console.WriteLine("  --scan=assemblies (default): Scan .dll and .exe files");
             Console.WriteLine("  --scan=non-assemblies: Scan all files except .dll and .exe");
             Console.WriteLine("  --remove-duplicates: Remove duplicate files and re-create archive with size comparison");
+            Console.WriteLine("  --analyze-different-tfms: Analyze files with same name/culture but different TFMs");
             return;
         }
 
@@ -20,6 +21,7 @@ public class Program
         string sdkPath = args[0];
         ScanType scanType = ScanType.Assemblies; // Default
         bool removeDuplicates = false;
+        bool analyzeDifferentTfms = false;
 
         // Look for options
         foreach (var arg in args)
@@ -44,6 +46,10 @@ public class Program
             else if (arg.Equals("--remove-duplicates", StringComparison.OrdinalIgnoreCase))
             {
                 removeDuplicates = true;
+            }
+            else if (arg.Equals("--analyze-different-tfms", StringComparison.OrdinalIgnoreCase))
+            {
+                analyzeDifferentTfms = true;
             }
         }
 
@@ -102,6 +108,17 @@ public class Program
             }
 
             PrintSummary(duplicateGroups, originalArchiveSize, newArchiveSize);
+
+            // Analyze different TFM duplicates if requested
+            if (analyzeDifferentTfms)
+            {
+                Console.WriteLine();
+                Console.WriteLine("=========================================");
+                Console.WriteLine("Different TFM Duplicate Analysis");
+                Console.WriteLine("=========================================");
+                Console.WriteLine();
+                AnalyzeDifferentTfmDuplicates(results);
+            }
         }
         finally
         {
@@ -627,6 +644,180 @@ public class Program
             Console.WriteLine($"  Size reduction (MB): {reductionMB:F1}");
             Console.WriteLine($"  Size reduction (%): {reductionPercent:F1}%");
         }
+    }
+
+    private enum TfmType
+    {
+        Unknown,
+        NetFx,        // .NET Framework (net472, net48, etc.)
+        NetCore,      // .NET Core/Modern .NET (net8.0, net10.0, netcoreapp, etc.)
+        NetStandard   // .NET Standard (netstandard2.0, etc.)
+    }
+
+    private static TfmType GetTfmType(string? tfm)
+    {
+        if (string.IsNullOrEmpty(tfm))
+            return TfmType.Unknown;
+
+        var tfmLower = tfm.ToLowerInvariant();
+
+        // Handle full framework names (e.g., ".NETStandard,Version=v2.0")
+        if (tfmLower.Contains("netstandard"))
+            return TfmType.NetStandard;
+
+        if (tfmLower.Contains("netcoreapp") || tfmLower.Contains(".netcoreapp"))
+            return TfmType.NetCore;
+
+        if (tfmLower.Contains("netframework") || tfmLower.Contains(".netframework"))
+            return TfmType.NetFx;
+
+        // Handle short TFM names (e.g., "net8.0", "net472")
+        if (tfmLower.StartsWith("net"))
+        {
+            // net5.0 and above are .NET Core/Modern .NET
+            if (tfmLower.Contains("."))
+                return TfmType.NetCore;
+
+            // Try to parse the version number after "net"
+            var versionPart = tfmLower.Substring(3);
+            if (double.TryParse(versionPart, out var version))
+            {
+                if (version >= 5)
+                    return TfmType.NetCore;
+                else
+                    return TfmType.NetFx; // net35, net40, net45, net472, etc.
+            }
+        }
+
+        return TfmType.Unknown;
+    }
+
+    private static void AnalyzeDifferentTfmDuplicates(List<SdkFileInfo> results)
+    {
+        // Group by (Filename, Culture) only - ignoring TargetFramework
+        var differentTfmGroups = results
+            .Where(f => !string.IsNullOrEmpty(f.TargetFramework))
+            .GroupBy(f => (f.Filename, f.Culture))
+            .Where(g => g.Select(f => f.TargetFramework).Distinct().Count() > 1)
+            .ToList();
+
+        Console.WriteLine($"Total groups with multiple TFMs: {differentTfmGroups.Count}");
+        Console.WriteLine();
+
+        // Categorize groups
+        int coreVsFxCount = 0;
+        int differentFxVersionsCount = 0;
+        int differentCoreVersionsCount = 0;
+        int multipleNetStandardVersionsCount = 0;
+        int netStandardAndNetFxCount = 0;
+        int netStandardAndCoreCount = 0;
+
+        long differentFxVersionsSavings = 0;
+        long differentCoreVersionsSavings = 0;
+        long netStandardAndNetFxSavings = 0;
+        long netStandardAndCoreSavings = 0;
+
+        foreach (var group in differentTfmGroups)
+        {
+            var tfmTypes = group.Select(f => (f.TargetFramework, Type: GetTfmType(f.TargetFramework)))
+                               .ToList();
+
+            var distinctTypes = tfmTypes.Select(t => t.Type).Distinct().ToList();
+            var hasFx = distinctTypes.Contains(TfmType.NetFx);
+            var hasCore = distinctTypes.Contains(TfmType.NetCore);
+            var hasNetStandard = distinctTypes.Contains(TfmType.NetStandard);
+
+            // Count different FX versions (only if no NetStandard or Core in the group)
+            var fxVersions = tfmTypes.Where(t => t.Type == TfmType.NetFx).Select(t => t.TargetFramework).Distinct().ToList();
+            if (fxVersions.Count > 1 && !hasNetStandard && !hasCore)
+            {
+                differentFxVersionsCount++;
+                // Keep lowest version (earliest framework)
+                var sortedFx = group.Where(f => GetTfmType(f.TargetFramework) == TfmType.NetFx)
+                                   .OrderBy(f => f.TargetFramework)
+                                   .ToList();
+                if (sortedFx.Any())
+                {
+                    var toKeep = sortedFx.First();
+                    differentFxVersionsSavings += sortedFx.Skip(1).Sum(f => f.FileSize);
+                }
+            }
+
+            // Count different Core versions (only if no NetStandard or FX in the group)
+            var coreVersions = tfmTypes.Where(t => t.Type == TfmType.NetCore).Select(t => t.TargetFramework).Distinct().ToList();
+            if (coreVersions.Count > 1 && !hasNetStandard && !hasFx)
+            {
+                differentCoreVersionsCount++;
+                // Keep lowest version
+                var sortedCore = group.Where(f => GetTfmType(f.TargetFramework) == TfmType.NetCore)
+                                     .OrderBy(f => f.TargetFramework)
+                                     .ToList();
+                if (sortedCore.Any())
+                {
+                    var toKeep = sortedCore.First();
+                    differentCoreVersionsSavings += sortedCore.Skip(1).Sum(f => f.FileSize);
+                }
+            }
+
+            // Count multiple NetStandard versions
+            var netStandardVersions = tfmTypes.Where(t => t.Type == TfmType.NetStandard).Select(t => t.TargetFramework).Distinct().ToList();
+            if (netStandardVersions.Count > 1)
+            {
+                multipleNetStandardVersionsCount++;
+            }
+
+            // NetStandard + NetFx
+            if (hasNetStandard && hasFx)
+            {
+                netStandardAndNetFxCount++;
+                // Keep NetStandard
+                var netStandardFiles = group.Where(f => GetTfmType(f.TargetFramework) == TfmType.NetStandard).ToList();
+                var fxFiles = group.Where(f => GetTfmType(f.TargetFramework) == TfmType.NetFx).ToList();
+                if (netStandardFiles.Any())
+                {
+                    netStandardAndNetFxSavings += fxFiles.Sum(f => f.FileSize);
+                }
+            }
+
+            // NetStandard + Core
+            if (hasNetStandard && hasCore)
+            {
+                netStandardAndCoreCount++;
+                // Keep NetStandard
+                var netStandardFiles = group.Where(f => GetTfmType(f.TargetFramework) == TfmType.NetStandard).ToList();
+                var coreFiles = group.Where(f => GetTfmType(f.TargetFramework) == TfmType.NetCore).ToList();
+                if (netStandardFiles.Any())
+                {
+                    netStandardAndCoreSavings += coreFiles.Sum(f => f.FileSize);
+                }
+            }
+
+            // Core vs FX (count any group that has both, regardless of NetStandard)
+            if (hasCore && hasFx)
+            {
+                coreVsFxCount++;
+            }
+        }
+
+        Console.WriteLine("Group Categorization:");
+        Console.WriteLine($"  Groups differing by Core vs FX: {coreVsFxCount}");
+        Console.WriteLine($"  Groups with different FX versions: {differentFxVersionsCount}");
+        Console.WriteLine($"  Groups with different Core versions: {differentCoreVersionsCount}");
+        Console.WriteLine($"  Groups with multiple NetStandard versions: {multipleNetStandardVersionsCount}");
+        Console.WriteLine($"  Groups with NetStandard + NetFx: {netStandardAndNetFxCount}");
+        Console.WriteLine($"  Groups with NetStandard + Core: {netStandardAndCoreCount}");
+        Console.WriteLine();
+
+        Console.WriteLine("Potential Savings (if duplicates were eliminated):");
+        Console.WriteLine($"  Different FX versions (keep lowest): {differentFxVersionsSavings / 1024.0 / 1024.0:F1} MB");
+        Console.WriteLine($"  Different Core versions (keep lowest): {differentCoreVersionsSavings / 1024.0 / 1024.0:F1} MB");
+        Console.WriteLine($"  NetStandard + NetFx (keep NetStandard): {netStandardAndNetFxSavings / 1024.0 / 1024.0:F1} MB");
+        Console.WriteLine($"  NetStandard + Core (keep NetStandard): {netStandardAndCoreSavings / 1024.0 / 1024.0:F1} MB");
+        Console.WriteLine();
+
+        long totalSavings = differentFxVersionsSavings + differentCoreVersionsSavings +
+                           netStandardAndNetFxSavings + netStandardAndCoreSavings;
+        Console.WriteLine($"Total potential savings: {totalSavings / 1024.0 / 1024.0:F1} MB");
     }
 
     // Escapes a string for CSV output: wraps in double quotes if it contains comma or quote, and escapes embedded quotes

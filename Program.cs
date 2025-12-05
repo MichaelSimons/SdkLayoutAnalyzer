@@ -2,6 +2,7 @@
 using System.Formats.Tar;
 using System.Reflection.Metadata;
 using System.Reflection.PortableExecutable;
+using System.Runtime.InteropServices;
 
 public class Program
 {
@@ -66,6 +67,7 @@ public class Program
 
         try
         {
+            Console.WriteLine($"Starting analysis of: {sdkPath}");
             if (isArchive)
             {
                 tempDir = Path.Combine(Path.GetTempPath(), "SdkLayoutAnalyzer_" + Guid.NewGuid());
@@ -77,15 +79,19 @@ public class Program
             // Determine subdirectory to analyze (default to 'sdk' subfolder)
             string subDir = args.Length > 1 && !args[1].StartsWith("--") ? args[1] : "sdk";
             string analyzeDir = Path.Combine(sdkPath, subDir);
+            Console.WriteLine($"Analyzing directory: {analyzeDir}");
             if (!Directory.Exists(analyzeDir))
             {
-                Console.WriteLine($"Subdirectory '{subDir}' does not exist in extracted SDK.");
+                Console.WriteLine($"ERROR: Subdirectory '{subDir}' does not exist in extracted SDK.");
+                Console.WriteLine($"Full path checked: {Path.GetFullPath(analyzeDir)}");
                 return;
             }
 
             var results = Analyze(analyzeDir, scanType).ToList();
+            Console.WriteLine($"Analysis complete. Found {results.Count} files matching scan type.");
 
             var duplicateGroups = GetDuplicateGroups(results);
+            Console.WriteLine($"Identified {duplicateGroups.Count} duplicate groups.");
             PrintDuplicates(duplicateGroups, sdkPath);
 
             // Remove duplicates if requested
@@ -120,6 +126,11 @@ public class Program
                 AnalyzeDifferentTfmDuplicates(results);
             }
         }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"ERROR: {ex.GetType().Name}: {ex.Message}");
+            Console.WriteLine($"Stack trace: {ex.StackTrace}");
+        }
         finally
         {
             if (tempDir != null && Directory.Exists(tempDir))
@@ -132,59 +143,99 @@ public class Program
     private static IEnumerable<SdkFileInfo> Analyze(string rootDirectory, ScanType scanType)
     {
         var files = Directory.GetFiles(rootDirectory, "*", SearchOption.AllDirectories);
+
         foreach (var file in files)
         {
-            bool isAssembly = file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ||
-                             file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
 
-            // Filter based on scan type
-            if (scanType == ScanType.Assemblies && !isAssembly)
+            // Skip special files (FIFOs, sockets, devices) that might block on read
+            FileInfo fileInfo;
+            try
+            {
+                fileInfo = new FileInfo(file);
+                if (!fileInfo.Exists || (fileInfo.Attributes & FileAttributes.Device) != 0)
+                {
+                    continue;
+                }
+            }
+            catch
             {
                 continue;
             }
-            else if (scanType == ScanType.NonAssemblies && isAssembly)
-            {
-                continue;
-            }
 
-            var info = new SdkFileInfo
+            SdkFileInfo? info = null;
+            try
             {
-                Filename = Path.GetFileName(file),
-                FilePath = file,
-                FileSize = new FileInfo(file).Length,
-                FileHash = GetFileHash(file)
-            };
+                bool isAssembly = file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) ||
+                                 file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
 
-            // Try to get target framework from assembly attribute if .dll or .exe
-            if (file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-            {
+                // Filter based on scan type
+                if (scanType == ScanType.Assemblies && !isAssembly)
+                {
+                    continue;
+                }
+                else if (scanType == ScanType.NonAssemblies && isAssembly)
+                {
+                    continue;
+                }
+
+                string fileHash = GetFileHash(file);
+                string? fileIdentifier = GetFileIdentifier(file);
+
+                // Fallback: if we can't get inode, use hash
+                if (fileIdentifier == null)
+                {
+                    fileIdentifier = fileHash;
+                }
+
+                info = new SdkFileInfo
+                {
+                    Filename = Path.GetFileName(file),
+                    FilePath = file,
+                    FileSize = fileInfo.Length,
+                    FileHash = fileHash,
+                    FileIdentifier = fileIdentifier
+                };
+
+                // Try to get target framework from assembly attribute if .dll or .exe
+                if (file.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var assembly = System.Reflection.AssemblyName.GetAssemblyName(file);
+                        info = info with { AssemblyVersion = assembly.Version?.ToString(), Culture = string.IsNullOrEmpty(assembly.CultureName) ? "neutral" : assembly.CultureName };
+
+                        // Try to get TargetFrameworkAttribute from assembly metadata using reflection-only loading
+                        info = info with { TargetFramework = GetTargetFrameworkFromAssembly(file) };
+                    }
+                    catch { }
+                }
+
+                // Try to get file version info (applies to many file types)
                 try
                 {
-                    var assembly = System.Reflection.AssemblyName.GetAssemblyName(file);
-                    info = info with { AssemblyVersion = assembly.Version?.ToString(), Culture = string.IsNullOrEmpty(assembly.CultureName) ? "neutral" : assembly.CultureName };
+                    var versionInfo = System.Diagnostics.FileVersionInfo.GetVersionInfo(file);
+                    info = info with { FileVersion = versionInfo.FileVersion };
+                }
+                catch { }
 
-                    // Try to get TargetFrameworkAttribute from assembly metadata using reflection-only loading
-                    info = info with { TargetFramework = GetTargetFrameworkFromAssembly(file) };
+                // Try to get architecture from PE header
+                try
+                {
+                    info = info with { Architecture = GetArchitecture(file) };
                 }
                 catch { }
             }
-
-            // Try to get file version info (applies to many file types)
-            try
+            catch (Exception ex)
             {
-                var versionInfo = System.Diagnostics.FileVersionInfo.GetVersionInfo(file);
-                info = info with { FileVersion = versionInfo.FileVersion };
+                Console.WriteLine($"ERROR processing file {file}: {ex.GetType().Name}: {ex.Message}");
+                // Continue with next file
+                continue;
             }
-            catch { }
 
-            // Try to get architecture from PE header
-            try
+            if (info != null)
             {
-                info = info with { Architecture = GetArchitecture(file) };
+                yield return info;
             }
-            catch { }
-
-            yield return info;
         }
     }
 
@@ -194,6 +245,97 @@ public class Program
         using var stream = File.OpenRead(filePath);
         var hash = sha256.ComputeHash(stream);
         return Convert.ToHexStringLower(hash);
+    }
+
+    private static string? GetFileIdentifier(string filePath)
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                return GetFileIdentifierWindows(filePath);
+            }
+            else
+            {
+                return GetFileIdentifierUnix(filePath);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? GetFileIdentifierWindows(string filePath)
+    {
+        // Use FileStream to get handle, then query file info
+        try
+        {
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var handle = fs.SafeFileHandle.DangerousGetHandle();
+
+            if (GetFileInformationByHandle(handle, out var fileInfo))
+            {
+                ulong fileId = ((ulong)fileInfo.nFileIndexHigh << 32) | fileInfo.nFileIndexLow;
+                return $"{fileInfo.dwVolumeSerialNumber:X8}-{fileId:X16}";
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    private static string? GetFileIdentifierUnix(string filePath)
+    {
+        // Use stat command to get device and inode - much more reliable than P/Invoke
+        try
+        {
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "stat",
+                Arguments = $"-c \"%d-%i\" \"{filePath}\"",
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+
+            using var process = System.Diagnostics.Process.Start(psi);
+            if (process != null)
+            {
+                string output = process.StandardOutput.ReadToEnd().Trim();
+                process.WaitForExit();
+                if (process.ExitCode == 0 && !string.IsNullOrEmpty(output))
+                {
+                    return output; // Format: "device-inode"
+                }
+            }
+        }
+        catch { }
+        return null;
+    }
+
+    // Windows P/Invoke
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        IntPtr hFile,
+        out BY_HANDLE_FILE_INFORMATION lpFileInformation);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint dwFileAttributes;
+        public uint ftCreationTimeLow;
+        public uint ftCreationTimeHigh;
+        public uint ftLastAccessTimeLow;
+        public uint ftLastAccessTimeHigh;
+        public uint ftLastWriteTimeLow;
+        public uint ftLastWriteTimeHigh;
+        public uint dwVolumeSerialNumber;
+        public uint nFileSizeHigh;
+        public uint nFileSizeLow;
+        public uint nNumberOfLinks;
+        public uint nFileIndexHigh;
+        public uint nFileIndexLow;
     }
 
     private static string? GetArchitecture(string filePath)
@@ -354,24 +496,8 @@ public class Program
         }
         else if (archivePath.EndsWith(".tar.gz", StringComparison.OrdinalIgnoreCase) || archivePath.EndsWith(".tgz", StringComparison.OrdinalIgnoreCase))
         {
-            using FileStream fs = File.OpenRead(archivePath);
-            using var gzip = new GZipStream(fs, CompressionMode.Decompress);
-            using var tar = new TarReader(gzip);
-            TarEntry? entry;
-            while ((entry = tar.GetNextEntry()) != null)
-            {
-                string outPath = Path.Combine(tempDir, entry.Name.Replace('/', Path.DirectorySeparatorChar));
-                if (entry.EntryType == TarEntryType.Directory)
-                {
-                    Directory.CreateDirectory(outPath);
-                }
-                else if (entry.EntryType == TarEntryType.RegularFile)
-                {
-                    Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);
-                    using var outStream = File.Create(outPath);
-                    entry.DataStream?.CopyTo(outStream);
-                }
-            }
+            // TarFile.ExtractToDirectory handles all entry types including hardlinks automatically
+            TarFile.ExtractToDirectory(archivePath, tempDir, overwriteFiles: true);
         }
         else
         {
@@ -393,14 +519,22 @@ public class Program
 
     private static void PrintDuplicates(List<IGrouping<(string? Filename, string? Culture, string? TargetFramework), SdkFileInfo>> duplicateGroups, string tempDir)
     {
-        Console.WriteLine("Filename,Culture,TargetFramework,RelativePath,AssemblyVersion,FileVersion,Architecture,FileHash,FileSize");
+        Console.WriteLine("Filename,Culture,TargetFramework,RelativePath,AssemblyVersion,FileVersion,Architecture,FileHash,FileSize,FileIdentifier,IsHardlinked");
         foreach (var group in duplicateGroups)
         {
+            // Determine which files are hardlinked within this group
+            var fileIdGroups = group.GroupBy(f => f.FileIdentifier).ToList();
+            bool hasHardlinks = fileIdGroups.Any(g => g.Count() > 1);
+
             foreach (var info in group.OrderBy(f => f.FilePath))
             {
                 string relPath = Path.GetRelativePath(tempDir, info.FilePath ?? "");
                 string tfm = EscapeCsv(info.TargetFramework);
-                Console.WriteLine($"{info.Filename},{info.Culture},{tfm},{relPath},{info.AssemblyVersion},{info.FileVersion},{info.Architecture},{info.FileHash},{info.FileSize}");
+
+                // Check if this file is hardlinked to any other file in the group
+                bool isHardlinked = fileIdGroups.FirstOrDefault(g => g.Key == info.FileIdentifier)?.Count() > 1;
+
+                Console.WriteLine($"{info.Filename},{info.Culture},{tfm},{relPath},{info.AssemblyVersion},{info.FileVersion},{info.Architecture},{info.FileHash},{info.FileSize},{info.FileIdentifier},{isHardlinked}");
             }
         }
     }
@@ -521,13 +655,39 @@ public class Program
     {
         int totalDuplicatedFiles = duplicateGroups.Sum(g => g.Count() - 1);
 
-        // Calculate total duplicated content by choosing which file to keep and summing the other files' actual sizes
-        long totalDuplicatedContent = duplicateGroups.Sum(g =>
+        // Calculate total duplicated content WITHOUT considering hardlinks (baseline)
+        long totalDuplicatedContentBaseline = duplicateGroups.Sum(g =>
         {
             var fileToKeep = GetFileToKeep(g);
-            // Sum the actual sizes of all OTHER files (the duplicates that would be removed)
-            return g.Where(f => f != fileToKeep).Sum(f => f.FileSize);
+            var duplicates = g.Where(f => f != fileToKeep);
+            // Sum all duplicate file sizes, treating hardlinks as separate files
+            return duplicates.Sum(f => f.FileSize);
         });
+
+        // Calculate how much space is saved by hardlinks
+        int totalHardlinkedFiles = 0;
+        long spaceAlreadySavedByHardlinks = 0;
+
+        foreach (var group in duplicateGroups)
+        {
+            // Group ALL files (including fileToKeep) by FileIdentifier to find hardlinks
+            var fileIdGroups = group.GroupBy(f => f.FileIdentifier).ToList();
+
+            foreach (var idGroup in fileIdGroups)
+            {
+                if (idGroup.Count() > 1)
+                {
+                    // These files are hardlinked together - they share physical storage
+                    // Space saved = (number of hardlinks - 1) * file size
+                    // Don't count the first one (it's the one we "keep"), count the rest as saved
+                    totalHardlinkedFiles += idGroup.Count() - 1;
+                    spaceAlreadySavedByHardlinks += (idGroup.Count() - 1) * idGroup.First().FileSize;
+                }
+            }
+        }
+
+        // Remaining duplicated content after hardlinks
+        long totalDuplicatedContent = totalDuplicatedContentBaseline - spaceAlreadySavedByHardlinks;
 
         // Calculate duplicate categorization statistics
         int sameHashCount = 0;
@@ -544,8 +704,20 @@ public class Program
             var fileToKeep = GetFileToKeep(group);
             var duplicates = group.Where(f => f != fileToKeep);
 
-            foreach (var duplicate in duplicates)
+            // Group duplicates by FileIdentifier to avoid double-counting hardlinked files
+            var physicalDuplicates = duplicates.GroupBy(f => f.FileIdentifier);
+
+            foreach (var idGroup in physicalDuplicates)
             {
+                // Use the first file in each hardlink group as representative
+                var duplicate = idGroup.First();
+
+                // Skip if this duplicate is hardlinked to fileToKeep (same physical file, no space used)
+                if (duplicate.FileIdentifier == fileToKeep.FileIdentifier)
+                {
+                    continue;
+                }
+
                 // Get versions for comparison
                 string? keepVersion = fileToKeep.AssemblyVersion ?? fileToKeep.FileVersion;
                 string? dupVersion = duplicate.AssemblyVersion ?? duplicate.FileVersion;
@@ -582,7 +754,12 @@ public class Program
 
         Console.WriteLine();
         Console.WriteLine($"Total duplicated files (extra copies): {totalDuplicatedFiles}");
-        Console.WriteLine($"Total duplicated file content (MB): {totalDuplicatedContent / 1024.0 / 1024.0:F1}");
+        Console.WriteLine($"Total duplicated file content (baseline, MB): {totalDuplicatedContentBaseline / 1024.0 / 1024.0:F1}");
+        Console.WriteLine();
+        Console.WriteLine("Hardlink deduplication status:");
+        Console.WriteLine($"  Files already deduplicated via hardlinks: {totalHardlinkedFiles}");
+        Console.WriteLine($"  Space already saved by hardlinks (MB): {spaceAlreadySavedByHardlinks / 1024.0 / 1024.0:F1}");
+        Console.WriteLine($"  Remaining duplicate content (MB): {totalDuplicatedContent / 1024.0 / 1024.0:F1}");
         Console.WriteLine();
         Console.WriteLine("Duplicate categorization (relative to lowest version file to keep):");
         Console.WriteLine($"  Duplicates with same hash as file to keep: {sameHashCount} ({sameHashSize / 1024.0 / 1024.0:F1} MB)");
@@ -590,19 +767,19 @@ public class Program
         Console.WriteLine($"  Duplicates with same version but different hash: {sameVersionDifferentHashCount} ({sameVersionDifferentHashSize / 1024.0 / 1024.0:F1} MB)");
         Console.WriteLine($"    Of which, same version but different arch: {sameVersionDifferentArchCount} ({sameVersionDifferentArchSize / 1024.0 / 1024.0:F1} MB)");
 
-        // Verify counts add up correctly
-        int categorySum = sameHashCount + differentVersionCount + sameVersionDifferentHashCount;
-        if (categorySum != totalDuplicatedFiles)
-        {
-            Console.WriteLine($"  WARNING: Category counts ({categorySum}) do not match total duplicated files ({totalDuplicatedFiles})");
-        }
+        // Note: Category counts represent unique physical files (after accounting for hardlinks)
+        // so they may not match totalDuplicatedFiles which counts all logical duplicates
+        int uniquePhysicalDuplicates = sameHashCount + differentVersionCount + sameVersionDifferentHashCount;
 
         var topDuplicated = duplicateGroups
             .Select(g =>
             {
                 var fileToKeep = GetFileToKeep(g);
-                // Sum the actual sizes of all OTHER files (the duplicates that would be removed)
-                long aggregateDuplicatedSize = g.Where(f => f != fileToKeep).Sum(f => f.FileSize);
+                var duplicates = g.Where(f => f != fileToKeep);
+
+                // Group by FileIdentifier to avoid double-counting hardlinked files
+                var physicalDupes = duplicates.GroupBy(f => f.FileIdentifier);
+                long aggregateDuplicatedSize = physicalDupes.Sum(idGroup => idGroup.First().FileSize);
 
                 return new
                 {
@@ -843,6 +1020,7 @@ public class Program
         public string? FileHash { get; init; }
         public long FileSize { get; init; }
         public string? TargetFramework { get; init; }
+        public string? FileIdentifier { get; init; } // Unique file ID (inode on Unix, file ID on Windows)
     }
 
     internal class CustomAttributeTypeProvider : ICustomAttributeTypeProvider<object>

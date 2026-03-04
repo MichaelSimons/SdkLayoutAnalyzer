@@ -179,7 +179,21 @@ public class Program
                 }
 
                 string fileHash = GetFileHash(file);
-                string? fileIdentifier = GetFileIdentifier(file);
+                var fileLinkInfo = GetFileLinkInfo(file);
+                string? fileIdentifier = fileLinkInfo.Identifier;
+                bool isSymlink = fileInfo.LinkTarget != null;
+
+                // FileInfo.Length for symlinks returns the symlink path length, not the target size.
+                // Resolve to the target to get the actual file size.
+                long fileSize = fileInfo.Length;
+                if (isSymlink)
+                {
+                    var resolvedTarget = fileInfo.ResolveLinkTarget(returnFinalTarget: true);
+                    if (resolvedTarget != null)
+                    {
+                        fileSize = new FileInfo(resolvedTarget.FullName).Length;
+                    }
+                }
 
                 // Fallback: if we can't get inode, use hash
                 if (fileIdentifier == null)
@@ -191,9 +205,11 @@ public class Program
                 {
                     Filename = Path.GetFileName(file),
                     FilePath = file,
-                    FileSize = fileInfo.Length,
+                    FileSize = fileSize,
                     FileHash = fileHash,
-                    FileIdentifier = fileIdentifier
+                    FileIdentifier = fileIdentifier,
+                    LinkCount = fileLinkInfo.LinkCount,
+                    IsSymlink = isSymlink
                 };
 
                 // Try to get target framework from assembly attribute if .dll or .exe
@@ -247,26 +263,28 @@ public class Program
         return Convert.ToHexStringLower(hash);
     }
 
-    private static string? GetFileIdentifier(string filePath)
+    private record FileLinkInfo(string? Identifier, uint LinkCount);
+
+    private static FileLinkInfo GetFileLinkInfo(string filePath)
     {
         try
         {
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
-                return GetFileIdentifierWindows(filePath);
+                return GetFileLinkInfoWindows(filePath);
             }
             else
             {
-                return GetFileIdentifierUnix(filePath);
+                return GetFileLinkInfoUnix(filePath);
             }
         }
         catch
         {
-            return null;
+            return new FileLinkInfo(null, 1);
         }
     }
 
-    private static string? GetFileIdentifierWindows(string filePath)
+    private static FileLinkInfo GetFileLinkInfoWindows(string filePath)
     {
         // Use FileStream to get handle, then query file info
         try
@@ -277,22 +295,23 @@ public class Program
             if (GetFileInformationByHandle(handle, out var fileInfo))
             {
                 ulong fileId = ((ulong)fileInfo.nFileIndexHigh << 32) | fileInfo.nFileIndexLow;
-                return $"{fileInfo.dwVolumeSerialNumber:X8}-{fileId:X16}";
+                var identifier = $"{fileInfo.dwVolumeSerialNumber:X8}-{fileId:X16}";
+                return new FileLinkInfo(identifier, fileInfo.nNumberOfLinks);
             }
         }
         catch { }
-        return null;
+        return new FileLinkInfo(null, 1);
     }
 
-    private static string? GetFileIdentifierUnix(string filePath)
+    private static FileLinkInfo GetFileLinkInfoUnix(string filePath)
     {
-        // Use stat command to get device and inode - much more reliable than P/Invoke
+        // Use stat command to get device, inode, and link count
         try
         {
             var psi = new System.Diagnostics.ProcessStartInfo
             {
                 FileName = "stat",
-                Arguments = $"-c \"%d-%i\" \"{filePath}\"",
+                Arguments = $"-c \"%d-%i %h\" \"{filePath}\"",
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
                 UseShellExecute = false,
@@ -306,12 +325,16 @@ public class Program
                 process.WaitForExit();
                 if (process.ExitCode == 0 && !string.IsNullOrEmpty(output))
                 {
-                    return output; // Format: "device-inode"
+                    // Format: "device-inode linkcount"
+                    var parts = output.Split(' ', 2);
+                    var identifier = parts[0];
+                    uint linkCount = parts.Length > 1 && uint.TryParse(parts[1], out var lc) ? lc : 1;
+                    return new FileLinkInfo(identifier, linkCount);
                 }
             }
         }
         catch { }
-        return null;
+        return new FileLinkInfo(null, 1);
     }
 
     // Windows P/Invoke
@@ -519,22 +542,17 @@ public class Program
 
     private static void PrintDuplicates(List<IGrouping<(string? Filename, string? Culture, string? TargetFramework), SdkFileInfo>> duplicateGroups, string tempDir)
     {
-        Console.WriteLine("Filename,Culture,TargetFramework,RelativePath,AssemblyVersion,FileVersion,Architecture,FileHash,FileSize,FileIdentifier,IsHardlinked");
+        Console.WriteLine("Filename,Culture,TargetFramework,RelativePath,AssemblyVersion,FileVersion,Architecture,FileHash,FileSize,FileIdentifier,IsHardlinked,IsSymlink");
         foreach (var group in duplicateGroups)
         {
-            // Determine which files are hardlinked within this group
-            var fileIdGroups = group.GroupBy(f => f.FileIdentifier).ToList();
-            bool hasHardlinks = fileIdGroups.Any(g => g.Count() > 1);
-
             foreach (var info in group.OrderBy(f => f.FilePath))
             {
                 string relPath = Path.GetRelativePath(tempDir, info.FilePath ?? "");
                 string tfm = EscapeCsv(info.TargetFramework);
 
-                // Check if this file is hardlinked to any other file in the group
-                bool isHardlinked = fileIdGroups.FirstOrDefault(g => g.Key == info.FileIdentifier)?.Count() > 1;
+                bool isHardlinked = info.LinkCount > 1;
 
-                Console.WriteLine($"{info.Filename},{info.Culture},{tfm},{relPath},{info.AssemblyVersion},{info.FileVersion},{info.Architecture},{info.FileHash},{info.FileSize},{info.FileIdentifier},{isHardlinked}");
+                Console.WriteLine($"{info.Filename},{info.Culture},{tfm},{relPath},{info.AssemblyVersion},{info.FileVersion},{info.Architecture},{info.FileHash},{info.FileSize},{info.FileIdentifier},{isHardlinked},{info.IsSymlink}");
             }
         }
     }
@@ -664,14 +682,26 @@ public class Program
             return duplicates.Sum(f => f.FileSize);
         });
 
-        // Calculate how much space is saved by hardlinks
+        // Calculate how much space is saved by hardlinks and symlinks
         int totalHardlinkedFiles = 0;
         long spaceAlreadySavedByHardlinks = 0;
+        int totalSymlinkedFiles = 0;
+        long spaceAlreadySavedBySymlinks = 0;
 
         foreach (var group in duplicateGroups)
         {
-            // Group ALL files (including fileToKeep) by FileIdentifier to find hardlinks
-            var fileIdGroups = group.GroupBy(f => f.FileIdentifier).ToList();
+            // Count symlinked files (symlinks don't use real space, only the path string)
+            foreach (var file in group)
+            {
+                if (file.IsSymlink)
+                {
+                    totalSymlinkedFiles++;
+                    spaceAlreadySavedBySymlinks += file.FileSize;
+                }
+            }
+
+            // Group ALL non-symlink files by FileIdentifier to find hardlinks
+            var fileIdGroups = group.Where(f => !f.IsSymlink).GroupBy(f => f.FileIdentifier).ToList();
 
             foreach (var idGroup in fileIdGroups)
             {
@@ -686,8 +716,8 @@ public class Program
             }
         }
 
-        // Remaining duplicated content after hardlinks
-        long totalDuplicatedContent = totalDuplicatedContentBaseline - spaceAlreadySavedByHardlinks;
+        // Remaining duplicated content after hardlinks and symlinks
+        long totalDuplicatedContent = totalDuplicatedContentBaseline - spaceAlreadySavedByHardlinks - spaceAlreadySavedBySymlinks;
 
         // Calculate duplicate categorization statistics
         int sameHashCount = 0;
@@ -702,7 +732,7 @@ public class Program
         foreach (var group in duplicateGroups)
         {
             var fileToKeep = GetFileToKeep(group);
-            var duplicates = group.Where(f => f != fileToKeep);
+            var duplicates = group.Where(f => f != fileToKeep && !f.IsSymlink);
 
             // Group duplicates by FileIdentifier to avoid double-counting hardlinked files
             var physicalDuplicates = duplicates.GroupBy(f => f.FileIdentifier);
@@ -756,9 +786,11 @@ public class Program
         Console.WriteLine($"Total duplicated files (extra copies): {totalDuplicatedFiles}");
         Console.WriteLine($"Total duplicated file content (baseline, MB): {totalDuplicatedContentBaseline / 1024.0 / 1024.0:F1}");
         Console.WriteLine();
-        Console.WriteLine("Hardlink deduplication status:");
+        Console.WriteLine("Link deduplication status:");
         Console.WriteLine($"  Files already deduplicated via hardlinks: {totalHardlinkedFiles}");
         Console.WriteLine($"  Space already saved by hardlinks (MB): {spaceAlreadySavedByHardlinks / 1024.0 / 1024.0:F1}");
+        Console.WriteLine($"  Files already deduplicated via symlinks: {totalSymlinkedFiles}");
+        Console.WriteLine($"  Space already saved by symlinks (MB): {spaceAlreadySavedBySymlinks / 1024.0 / 1024.0:F1}");
         Console.WriteLine($"  Remaining duplicate content (MB): {totalDuplicatedContent / 1024.0 / 1024.0:F1}");
         Console.WriteLine();
         Console.WriteLine("Duplicate categorization (relative to lowest version file to keep):");
@@ -1021,6 +1053,8 @@ public class Program
         public long FileSize { get; init; }
         public string? TargetFramework { get; init; }
         public string? FileIdentifier { get; init; } // Unique file ID (inode on Unix, file ID on Windows)
+        public uint LinkCount { get; init; } // Number of hard links to this file
+        public bool IsSymlink { get; init; } // Whether this file is a symbolic link
     }
 
     internal class CustomAttributeTypeProvider : ICustomAttributeTypeProvider<object>

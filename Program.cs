@@ -755,6 +755,11 @@ public class Program
                 if (duplicate.FileHash == fileToKeep.FileHash)
                 {
                     // Same hash as file to keep
+                    // Skip if fileToKeep is a symlink - this duplicate is the symlink target, already deduplicated
+                    if (fileToKeep.IsSymlink)
+                    {
+                        continue;
+                    }
                     sameHashCount++;
                     sameHashSize += duplicate.FileSize;
                 }

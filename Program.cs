@@ -812,11 +812,16 @@ public class Program
             .Select(g =>
             {
                 var fileToKeep = GetFileToKeep(g);
-                var duplicates = g.Where(f => f != fileToKeep);
+                var duplicates = g.Where(f => f != fileToKeep && !f.IsSymlink);
 
                 // Group by FileIdentifier to avoid double-counting hardlinked files
                 var physicalDupes = duplicates.GroupBy(f => f.FileIdentifier);
-                long aggregateDuplicatedSize = physicalDupes.Sum(idGroup => idGroup.First().FileSize);
+                // Skip files hardlinked to fileToKeep (same physical file)
+                long aggregateDuplicatedSize = physicalDupes
+                    .Where(idGroup => idGroup.Key != fileToKeep.FileIdentifier)
+                    // Skip same-hash duplicates when fileToKeep is a symlink (already deduplicated)
+                    .Where(idGroup => !(fileToKeep.IsSymlink && idGroup.First().FileHash == fileToKeep.FileHash))
+                    .Sum(idGroup => idGroup.First().FileSize);
 
                 return new
                 {
